@@ -2,23 +2,31 @@
 """Written in asyncio as a learning experiment. Python because the
 backup expiration logic is already in tarsnapper and well tested.
 """
-
-import os
-import sys
-import json
-from datetime import datetime, timedelta
 import asyncio
+import functools
+import json
+import os
+import signal
+import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import timedelta
+from typing import Optional
+
+import attr
 import confcollect
+import logbook
+import pendulum
+import pykube
+import structlog
 from aiochannel import Channel, ChannelEmpty
 from googleapiclient import discovery
 from oauth2client.service_account import ServiceAccountCredentials
 from tarsnapper.config import parse_deltas, ConfigError
 from tarsnapper.expire import expire
-import pykube
-import pendulum
-import logbook
-from asyncutils import combine, combine_latest, iterate_in_executor, exec
 
+from k8s_snapshots.asyncutils import combine_latest, exec
+from k8s_snapshots import errors
 
 # TODO: prevent a backup loop: A failsafe mechanism to make sure we
 #   don't create more than x snapshots per disk; in case something
@@ -27,10 +35,12 @@ from asyncutils import combine, combine_latest, iterate_in_executor, exec
 # TODO: Support loading configuration from a configmap.
 # TODO: We could use a third party resource type, too.
 
-logger = logbook.Logger('daemon')
+_logger = structlog.get_logger('daemon')
 
+_shutdown = False
 
 DEFAULT_CONFIG = {
+    'structlog_dev': False,
     'log_level': 'INFO',
     'gcloud_project': '',
     'gcloud_json_keyfile_name': '',
@@ -47,7 +57,9 @@ def validate_config(config):
     result = True
     for key in required_keys:
         if not config.get(key):
-            logbook.error('Environment variable {} is required', key.upper())
+            _logger.error(
+                'Environment variable is required',
+                key=key.upper())
             result = False
 
     return result
@@ -65,20 +77,22 @@ class Context:
     def make_kubeclient(self):
         cfg = None
 
-        if self.config.get('kube_config_file'):
-            logger.info('Loading kube config from {}', self.config['kube_config_file'])
-            cfg = pykube.KubeConfig.from_file(self.config['kube_config_file'])
+        kube_config_file = self.config.get('kube_config_file')
+
+        if kube_config_file:
+            _logger.info('Loading kube config', file=kube_config_file)
+            cfg = pykube.KubeConfig.from_file(kube_config_file)
 
         if not cfg:
             # See where we can get it from.
             default_file = os.path.expanduser('~/.kube/config')
             if os.path.exists(default_file):
-                logger.info('Loading kube config from {}', default_file)
+                _logger.info('Loading default kube config', file=default_file)
                 cfg = pykube.KubeConfig.from_file(default_file)
 
         # Maybe we are running inside Kubernetes.
         if not cfg:
-            logger.info('Using pod service account for kube auth')
+            _logger.info('Loading kube config from service account')
             cfg = pykube.KubeConfig.from_service_account()
 
         return pykube.HTTPClient(cfg)
@@ -104,17 +118,19 @@ class Context:
         return compute
 
 
+@attr.s(slots=True)
 class Rule:
-    """A rule describes how and when to make backups.
+    """
+    A rule describes how and when to make backups.
     """
 
-    name = None
-    namespace = None
-    deltas = None
-    deltas_unparsed = None
-    gce_disk = None
-    gce_disk_zone = None
-    claim_name = None
+    name = attr.ib()
+    namespace = attr.ib()
+    deltas = attr.ib()
+    deltas_unparsed = attr.ib()
+    gce_disk = attr.ib()
+    gce_disk_zone = attr.ib()
+    claim_name = attr.ib()
 
     @property
     def pretty_name(self):
@@ -133,8 +149,9 @@ def filter_snapshots_by_rule(snapshots, rule):
 
 
 def determine_next_snapshot(snapshots, rules):
-    """Given a list of snapshots, and a list of rules, determine
-    the next snapshot to be made.
+    """
+    Given a list of snapshots, and a list of rules, determine the next snapshot
+    to be made.
 
     Returns a 2-tuple (rule, target_datetime)
     """
@@ -152,18 +169,101 @@ def determine_next_snapshot(snapshots, rules):
 
         # There are no snapshots for this rule; create the first one.
         if not filtered:
-            logger.debug('No snapshot yet for {}, creating one now', rule)
+            _logger.debug('No snapshot yet for rule, creating one now', rule=rule)
             next_rule = rule
             next_timestamp = pendulum.now('utc') + timedelta(seconds=10)
             break
 
         target = filtered[0] + rule.deltas[0]
-        logger.debug('Next backup for {} is {}', rule, target)
+        _logger.debug('Next snapshot found', rule=rule, target=target)
         if not next_timestamp or target < next_timestamp:
             next_rule = rule
-            next_timestamp =target
+            next_timestamp = target
 
     return next_rule, next_timestamp
+
+
+def deltas_from_gce_pd(volume, api, annotation_key) -> Optional[str]:
+    """
+    Get the delta string based on a GCE PD volume.
+
+    Parameters
+    ----------
+
+    volume : pykube.objects.PersistentVolume
+        GCE PD Volume.
+    api : pykube.HTTPClient
+        Kubernetes client.
+    annotation_key : str
+        The annotation key to get deltas from..
+
+    Returns
+    -------
+    The delta string
+
+    """
+    deltas_str = volume.annotations.get(annotation_key)
+
+    _log = _logger.new(
+        annotation_key=annotation_key,
+        volume_name=volume.name,
+        volume=volume.obj,
+    )
+
+    if deltas_str is not None and deltas_str:
+        _log.info(
+            'Found delta annotation for volume',
+            deltas_str=deltas_str,
+        )
+        return deltas_str
+
+    _log.debug(
+        'Volume has no deltas annotation',
+        deltas_str=deltas_str
+    )
+
+    # If volume is not annotated, attempt ot read deltas from
+    # PersistentVolumeClaim referenced in volume.claimRef
+
+    claim_ref = volume.obj['spec'].get('claimRef')
+    _log = _log.bind(claim_ref=claim_ref)
+
+    if claim_ref is None:
+        _log.debug(
+            'Volume has no claimRef',
+        )
+        return
+
+    volume_claim = (
+        pykube.objects.PersistentVolumeClaim.objects(api)
+        .filter(namespace=claim_ref['namespace'])
+        .get_or_none(name=claim_ref['name'])
+    )
+    _log = _log.bind(
+        volume_claim_name=volume_claim.name,
+        volume_claim=volume_claim.obj,
+    )
+
+    if volume_claim is None:
+        _log.debug(
+            'Volume claim does not exist',
+        )
+        return
+
+    deltas_str = volume_claim.annotations.get(annotation_key)
+
+    if deltas_str is not None and deltas_str:
+        _log.debug(
+            'Found deltas for volume claim',
+            deltas_str=deltas_str,
+        )
+        return deltas_str
+
+    _log.debug(
+        'Volume claim has no deltas annotation',
+        deltas_str=deltas_str,
+    )
+    return
 
 
 def rule_from_pv(volume, api, deltas_annotation_key, use_claim_name=False):
@@ -171,41 +271,31 @@ def rule_from_pv(volume, api, deltas_annotation_key, use_claim_name=False):
     object. Can return None if this volume is not configured for
     backups, or is not suitable.
 
+    Parameters
+
     `use_claim_name` - if the persistent volume is bound, and it's
     name is auto-generated, then prefer to use the name of the claim
     for the snapshot.
     """
+    _log = _logger.new(
+        volume_name=volume.name,
+        volume=volume.obj,
+    )
 
     provider = volume.annotations.get('pv.kubernetes.io/provisioned-by')
+    _log = _log.new(provider=provider)
     if provider != 'kubernetes.io/gce-pd':
-        logger.debug('Volume {} not a GCE persistent disk', volume.name)
+        _log.debug('Volume not a GCE persistent disk', volume=volume)
         return
 
-    deltas_unparsed = volume.annotations.get(deltas_annotation_key)
-    if not deltas_unparsed:
-        logger.debug('Volume {} does not define backup deltas (via {})',
-            volume.name, deltas_annotation_key)
-
-        # If volume is not annotated, attempt ot read deltas from
-        # PersistentVolumeClaim referenced in volume.claimRef
-        if 'claimRef' not in volume.obj['spec']:
-            logger.debug(
-                'Volume {} does not contain a claimRef nor does it define deltas', volume.name)
-            return
-
-        ref = volume.obj['spec']['claimRef']
-        pvc = pykube.objects.PersistentVolumeClaim.objects(api).filter(
-            namespace=ref['namespace']).get_or_none(name=ref['name'])
-        if pvc is None:
-            logger.debug(
-                'Volume claim {} for volume {} does not exist',
-                ref['name'],
-                volume.name,
-            )
-            return
-        deltas_unparsed = pvc.annotations.get(deltas_annotation_key)
+    deltas_unparsed = deltas_from_gce_pd(volume, api, deltas_annotation_key)
+    _log = _log.bind(deltas_str=deltas_unparsed)
+    if deltas_unparsed is None:
+        _log.info('No deltas found for volume')
+        return
 
     try:
+        _log.debug('Parsing deltas', unparsed_deltas=deltas_unparsed)
         deltas = parse_deltas(deltas_unparsed)
 
         if not deltas:
@@ -214,19 +304,14 @@ def rule_from_pv(volume, api, deltas_annotation_key, use_claim_name=False):
                 '{!r}'.format(deltas)
             )
     except ConfigError as e:
-        logger.error(
-            'Deltas defined by volume {} are not valid, error message was: {}',
-            volume.name,
-            e,
+        _log.error(
+            'Volume deltas are not valid',
+            error=e,
         )
         return
 
-    rule = Rule()
-    rule.name = volume.name
-    rule.namespace = volume.namespace
-    rule.deltas = deltas
-    rule.deltas_unparsed = deltas_unparsed
-    rule.gce_disk = volume.obj['spec']['gcePersistentDisk']['pdName']
+    gce_disk = volume.obj['spec']['gcePersistentDisk']['pdName']
+
 
     # How can we know the zone? In theory, the storage class can
     # specify a zone; but if not specified there, K8s can choose a
@@ -237,12 +322,24 @@ def rule_from_pv(volume, api, deltas_annotation_key, use_claim_name=False):
     # Apparently, this is a thing in the Kubernetes source too, see:
     # getDiskByNameUnknownZone in pkg/cloudprovider/providers/gce/gce.go,
     # e.g. https://github.com/jsafrane/kubernetes/blob/2e26019629b5974b9a311a9f07b7eac8c1396875/pkg/cloudprovider/providers/gce/gce.go#L2455
-    rule.gce_disk_zone = volume.labels.get('failure-domain.beta.kubernetes.io/zone')
+    gce_disk_zone = volume.labels.get('failure-domain.beta.kubernetes.io/zone')
 
+    claim_name = None
     if use_claim_name and volume.obj['spec'].get('claimRef'):
         if volume.annotations.get('kubernetes.io/createdby') == 'gce-pd-dynamic-provisioner':
             ref = volume.obj['spec'].get('claimRef')
-            rule.claim_name = '{1}--{0}'.format(ref['name'], ref['namespace'])
+            claim_name = '{1}--{0}'.format(ref['name'], ref['namespace'])
+
+    rule = Rule(
+        name=volume.name,
+        namespace=volume.namespace,
+        deltas=deltas,
+        deltas_unparsed=deltas_unparsed,
+        gce_disk=gce_disk,
+        gce_disk_zone=gce_disk_zone,
+        claim_name=claim_name,
+    )
+
     return rule
 
 
@@ -250,12 +347,18 @@ def sync_get_rules(ctx):
     rules = {}
     api = ctx.make_kubeclient()
 
-    logger.debug('Observe persistent volume stream')
+    _logger.debug('Observe persistent volume stream')
     stream = pykube.objects.PersistentVolume.objects(api).watch().object_stream()
 
     for event in stream:
-        logger.debug('Event in persistent volume stream: {}', event)
-        vid = event.object.name
+        volume_name = event.object.name
+        _log = _logger.new(
+            volume_name=volume_name,
+            watch_event_type=event.type,
+            watch_event_object=event.object,
+        )
+
+        _log.debug('Event in persistent volume stream')
 
         if event.type == 'ADDED' or event.type == 'MODIFIED':
             rule = rule_from_pv(
@@ -263,27 +366,68 @@ def sync_get_rules(ctx):
                 api,
                 ctx.config.get('deltas_annotation_key'),
                 use_claim_name=ctx.config.get('use_claim_name'))
+
             if rule:
-                if event.type == 'ADDED' or not vid in rules:
-                    logger.info('Volume {} added to list of backup jobs with deltas {}',
-                        vid, rule.deltas_unparsed)
+                if event.type == 'ADDED' or not volume_name in rules:
+                    _log.info(
+                        'Volume added to list of backup jobs',
+                        deltas_str=rule.deltas_unparsed
+                    )
                 else:
-                    logger.info('Backup job for volume {} was updated', vid)
-                rules[vid] = rule
+                    _log.info('Backup job for volume was updated')
+                rules[volume_name] = rule
             else:
-                if vid in rules:
-                    logger.info('Volume {} removed from list of backup jobs', vid)
-                rules.pop(vid, False)
+                if volume_name in rules:
+                    _log.info('Volume removed from list of backup jobs')
+                rules.pop(volume_name, False)
 
         if event.type == 'DELETED':
-            rules.pop(vid, False)
+            rules.pop(volume_name, False)
 
         yield list(rules.values())
 
 
 async def get_rules(ctx):
-    async for item in iterate_in_executor(sync_get_rules, ctx):
-        yield ctx.config.get('rules') + item
+    _logger.debug('Getting rules')
+
+    channel = Channel()
+    _log = _logger.new(channel=channel)
+
+    def worker():
+        try:
+            _log.debug('Iterating in thread')
+            for value in sync_get_rules(ctx):
+                channel.put(value)
+
+        except errors.WorkerCancelledError:
+            _log.exception('Worker cancelled')
+        finally:
+            _log.debug('Closing channel')
+            channel.close()
+
+    thread = threading.Thread(
+        target=worker,
+        name='get_rules',
+        daemon=True
+    )
+    _log = _log.bind(thread=thread)
+
+    _log.debug('Starting iterator thread')
+    thread.start()
+
+    try:
+        async for item in channel:
+            _log.debug('Waiting for new item')
+            yield ctx.config.get('rules') + item
+
+    except asyncio.CancelledError:
+        _log.exception('Cancelled worker')
+    except Exception:
+        _log.exception('Unhandled exception while iterating')
+    finally:
+        _log.debug('Iterator exiting')
+        #thread.join(1)
+
 
 
 async def load_snapshots(ctx):
@@ -299,7 +443,7 @@ async def get_snapshots(ctx, reload_trigger):
     next backup to be scheduled.
     """
     yield await load_snapshots(ctx)
-    async for x in reload_trigger:
+    async for _ in reload_trigger:
         yield await load_snapshots(ctx)
 
 
@@ -314,17 +458,23 @@ async def watch_schedule(ctx, trigger):
 
     rulesgen = get_rules(ctx)
     snapgen = get_snapshots(ctx, trigger)
+    combined = combine_latest(
+        rules=rulesgen,
+        snapshots=snapgen,
+        defaults={'snapshots': None, 'rules': None})
 
-    async for item in combine_latest(
-            rules=rulesgen, snapshots=snapgen, defaults={'snapshots': None, 'rules': None}):
-        rules = item.get('rules')
-        snapshots = item.get('snapshots')
+    try:
+        async for item in combined:
+            rules = item.get('rules')
+            snapshots = item.get('snapshots')
 
-        # Never schedule before we don't have data from both rules and snapshots
-        if rules is None or snapshots is None:
-            continue
+            # Never schedule before we don't have data from both rules and snapshots
+            if rules is None or snapshots is None:
+                continue
 
-        yield determine_next_snapshot(snapshots, rules)
+            yield determine_next_snapshot(snapshots, rules)
+    except asyncio.CancelledError:
+        _logger.exception('Caught CancelledError while watching schedule')
 
 
 async def make_backup(ctx, rule):
@@ -335,21 +485,27 @@ async def make_backup(ctx, rule):
     3. Expire old snapshots
     """
     name = '{}-{}'.format(rule.pretty_name, pendulum.now('utc').format('%d%m%y-%H%M%S'))
+    _log = _logger.new(
+        name=name,
+        rule=rule)
 
-    logbook.info('Creating a snapshot for disk {} with name {}',
-        rule.name, name)
+    _log.info('Creating a snapshot')
 
-    result = await exec(ctx.gcloud.disks().createSnapshot(
-        disk=rule.gce_disk,
-        project=ctx.config['gcloud_project'],
-        zone=rule.gce_disk_zone,
-        body={"name": name}).execute)
+    try:
+        result = await exec(ctx.gcloud.disks().createSnapshot(
+            disk=rule.gce_disk,
+            project=ctx.config['gcloud_project'],
+            zone=rule.gce_disk_zone,
+            body={"name": name}).execute)
+    except Exception:
+        _log.exception('Error creating snapshot')
+        raise errors.Snap()
 
     # Immediately after creating the snapshot, it sometimes seems to
     # take some seconds before it can be queried.
     await asyncio.sleep(10)
 
-    logbook.debug('Waiting for snapshot to be ready')
+    _log.debug('Waiting for snapshot to be ready')
     while result['status'] in ('PENDING', 'UPLOADING', 'CREATING'):
         await asyncio.sleep(2)
         result = await exec(ctx.gcloud.snapshots().get(
@@ -357,23 +513,26 @@ async def make_backup(ctx, rule):
             project=ctx.config['gcloud_project']).execute)
 
     if not result['status'] == 'READY':
-        logger.error('Snapshot status is unexpected: {}', result['status'])
+        _log.error('Snapshot status is unexpected',
+                   result=result,
+                   status=result['status'])
         return
 
     await expire_snapshots(ctx, rule)
 
 
 async def expire_snapshots(ctx, rule):
-    """Expire existing snapshots for the rule.
     """
-    logbook.debug('Expire existing snapshots')
+    Expire existing snapshots for the rule.
+    """
+    _logger.info('Expire existing snapshots')
 
     snapshots = await load_snapshots(ctx)
     snapshots = filter_snapshots_by_rule(snapshots, rule)
     snapshots = {s['name']: pendulum.parse(s['creationTimestamp']) for s in snapshots}
 
     to_keep = expire(snapshots, rule.deltas)
-    logbook.info('Out of {} snapshots, we want to keep {}',
+    _logger.info('ex',
         len(snapshots), len(to_keep))
     for snapshot_name in snapshots:
         if snapshot_name in to_keep:
@@ -398,33 +557,37 @@ async def scheduler(ctx, scheduling_chan, snapshot_reload_trigger):
     next backup is scheduled.
     """
 
-    logger.info('Started scheduler task')
+    _logger.info('Started scheduler task')
 
     async for schedule in watch_schedule(ctx, snapshot_reload_trigger):
-        logger.debug('Scheduler determined a new target backup')
+        _logger.debug('Scheduler determined a new target backup')
         await scheduling_chan.put(schedule)
 
 
 async def backuper(ctx, scheduling_chan, snapshot_reload_trigger):
     """Will take tasks from the given queue, then execute the backup.
     """
-    logger.info('Started backup executor task')
+    _logger.info('Started backup executor task')
 
     current_target_time = current_target_rule = None
     while True:
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
 
         try:
             current_target_rule, current_target_time = scheduling_chan.get_nowait()
 
             # Log a message
             if not current_target_time:
-                backup_description = 'No backup scheduled'
+                _logger.info('schedule updated: No backups scheduled')
             else:
-                backup_description = '{0} at {1} ({2})'.format(
-                    current_target_rule, current_target_time.in_timezone('utc'),
-                    current_target_time.diff_for_humans())
-            logger.info('Next scheduled backup changed: {}', backup_description)
+                _logger.info(
+                    'schedule updated: Next backup changed',
+                    rule=current_target_rule,
+                    target_time=current_target_time,
+                    target_time_utc=current_target_time.in_timezone('utc'),
+                    diff=current_target_time.diff(),
+                    difference_str=current_target_time.diff_for_humans(),
+                )
         except ChannelEmpty:
             pass
 
@@ -439,10 +602,11 @@ async def backuper(ctx, scheduling_chan, snapshot_reload_trigger):
                 current_target_time = current_target_rule = None
 
 
-async def daemon(config):
+async def daemon(config, *, loop=None):
     """Main app; it runs two tasks; one schedules backups, the other
     one executes the.
     """
+    loop = loop or asyncio.get_event_loop()
 
     ctx = Context(config)
 
@@ -457,7 +621,36 @@ async def daemon(config):
         scheduler(ctx, scheduling_chan, snapshot_reload_trigger))
     backup_task = asyncio.ensure_future(
         backuper(ctx, scheduling_chan, snapshot_reload_trigger))
-    await asyncio.gather(schedule_task, backup_task)
+
+    tasks = [schedule_task, backup_task]
+
+    _logger.debug('Gathering tasks', tasks=tasks)
+
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        _logger.exception(
+            'Received CancelledError',
+            tasks=tasks
+        )
+
+        for task in tasks:
+            task.cancel()
+            _logger.debug('daemon cancelled task', task=task)
+
+        while True:
+            finished, pending = await asyncio.wait(
+                tasks,
+                return_when=asyncio.FIRST_COMPLETED)
+
+            _logger.debug(
+                'task completed',
+                finished=finished,
+                pending=pending)
+
+            if not pending:
+                _logger.debug('all tasks done')
+                raise
 
 
 def read_volume_config():
@@ -469,12 +662,11 @@ def read_volume_config():
         if not deltas:
             raise ConfigError('A volume {} was defined, but {} is not set'.format(name, env_name))
 
-
         zone = os.environ.get('VOLUME_{}_ZONE'.format(env_name))
         if not zone:
             raise ConfigError('A volume {} was defined, but {} is not set'.format(name, env_name))
 
-        logger.info('Loading env-defined volume {} with deltas {}', name, deltas)
+        _logger.info('Loading env-defined volume', volume=name, deltas=deltas)
 
         rule = Rule()
         rule.name = name
@@ -491,27 +683,143 @@ def read_volume_config():
     return config
 
 
+def configure_logging(config):
+    handler = logbook.StderrHandler(
+        level=config['log_level'],
+        format_string='{record.message}')
+
+    handler.push_application()
+    logger_factory = functools.partial(logbook.Logger, level=logbook.DEBUG)
+
+    def add_severity(logger, method_name, event_dict):
+        if method_name == 'warn':
+            method_name = 'warning'
+
+        event_dict['severity'] = method_name
+        return event_dict
+
+    def add_func_name(logger, method_rame, event_dict):
+        record = event_dict.get('_record')
+        if record is None:
+            return event_dict
+
+        event_dict['function'] = record.funcName
+
+        return event_dict
+
+    processors = [
+        add_func_name,
+        structlog.stdlib.add_logger_name,
+    ]
+
+    if config['structlog_dev']:
+        structlog.configure(
+            processors=processors + [
+                structlog.stdlib.add_log_level,
+                structlog.stdlib.PositionalArgumentsFormatter(),
+                structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M.%S"),
+                structlog.processors.StackInfoRenderer(),
+                structlog.processors.format_exc_info,
+                structlog.dev.ConsoleRenderer()  # <===
+            ],
+            context_class=dict,
+            logger_factory=logger_factory,
+            wrapper_class=structlog.stdlib.BoundLogger,
+            cache_logger_on_first_use=True,
+        )
+    else:
+        structlog.configure(
+            processors=processors + [
+                add_severity,
+                structlog.processors.TimeStamper(fmt="%Y-%m-%d %H:%M.%S"),
+                structlog.processors.JSONRenderer(indent=2, sort_keys=True)
+            ],
+            context_class=dict,
+            logger_factory=logger_factory
+        )
+
+    global _logger
+    _logger = structlog.get_logger()
+
+
 def main():
     config = DEFAULT_CONFIG.copy()
     config.update(confcollect.from_environ(by_defaults=DEFAULT_CONFIG))
 
-    logbook.StderrHandler(level=config['log_level']).push_application()
+    configure_logging(config)
 
     # Read manual volume definitions
     try:
         config.update(read_volume_config())
-    except ValueError as e:
-        logger.error(e)
+    except ValueError as exc:
+        _logger.error('config.read-volume-config.error', error=exc)
         return 1
 
     if not validate_config(config):
         return 1
 
-    event_loop = asyncio.get_event_loop()
+    _logger.bind(
+        gcloud_projec=config['gcloud_project'],
+        deltas_annotation_key=config['deltas_annotation_key'],
+    )
+
+    loop = asyncio.get_event_loop()
+
+    main_task = asyncio.ensure_future(daemon(config))
+
+    _log = _logger.new(loop=loop, main_task=main_task)
+
+    def handle_signal(name, timeout=10):
+        _log.info('Received signal', signal_name=name)
+        print_tasks()
+
+        if main_task.cancelled():
+            _log.info('main task already cancelled, forcing a quit')
+            return
+
+        _log.info(
+            'Cancelling main task',
+            task_cancel=main_task.cancel()
+        )
+
+    for sig_name in ['SIGINT', 'SIGTERM']:
+        loop.add_signal_handler(
+            getattr(signal, sig_name),
+            functools.partial(handle_signal, sig_name))
+
+    loop.add_signal_handler(signal.SIGUSR1, print_tasks)
+
     try:
-        event_loop.run_until_complete(daemon(config))
+        loop.run_until_complete(main_task)
+    except asyncio.CancelledError:
+        _log.exception('main task cancelled')
+    except Exception:
+        _log.exception('Unhandled exception in main task')
     finally:
-        event_loop.close()
+        loop.run_until_complete(shutdown(loop=loop))
+
+
+def print_tasks():
+    _logger.debug('print tasks', task=asyncio.Task.all_tasks())
+
+
+async def shutdown(*, loop=None):
+    loop = loop or asyncio.get_event_loop()
+
+    global _shutdown
+    if _shutdown:
+        _logger.warning('Already shutting down')
+        return
+
+    _shutdown = True
+
+    _logger.debug(
+        'shutting down',
+    )
+
+    print_tasks()
+
+    _logger.info('Shutdown complete')
 
 
 if __name__ == '__main__':
